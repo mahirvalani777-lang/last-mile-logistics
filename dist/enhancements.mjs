@@ -1,0 +1,54 @@
+const clone=x=>structuredClone(x);
+const ensure=(ok,message)=>{if(!ok)throw Error(message);};
+const finitePositive=n=>Number.isFinite(n)&&n>0;
+const cents=n=>Math.round((n+Number.EPSILON)*100);
+export function hydrateState(input){
+ const s=clone(input);s.masterRevision??=1;s.noteCounter??=1001;
+ for(const material of s.skus){if(!material.dimensions){const volume=material.unitVolume;material.dimensions=material.id==='LED'?{length:40,width:20,height:10}:material.id==='FAN'?{length:50,width:35,height:20}:{length:30,width:20,height:20};if(Math.abs(material.dimensions.length*material.dimensions.width*material.dimensions.height/1e6-volume)>.000001)material.dimensions=null;}material.revision??=1;}
+ for(const t of s.trucks){t.active??=true;t.revision??=1;}
+ for(const trip of s.shipments){trip.masterReviewRequired??=false;if(!trip.loadSnapshot){trip.loadSnapshot=load(s,trip);const t=s.trucks.find(t=>t.id===trip.truck);trip.truckSnapshot=t?{id:t.id,name:t.name,capacity:t.capacity,volume:t.volume,revision:t.revision}:null;}}
+ return s;
+}
+function load(s,trip){return trip.lines.reduce((result,line)=>{const m=s.skus.find(m=>m.id===line.sku);ensure(m&&finitePositive(m.unitWeight)&&finitePositive(m.unitVolume),'Material weight and dimensions must be complete.');result.weight+=line.packed*m.unitWeight;result.volume+=line.packed*m.unitVolume;return result;},{weight:0,volume:0});}
+export function directorSummary(s,filters={}){
+ const scope=s.shipments.filter(t=>t.dispatched&&(!filters.principal||t.principal===filters.principal)&&(!filters.warehouse||t.warehouse===filters.warehouse));
+ const declared=scope.filter(t=>t.costs&&['freight','holding','unloading','extras'].every(k=>Number.isFinite(t.costs[k])&&t.costs[k]>=0));
+ const comparable=declared.filter(t=>Number.isFinite(t.estimate)&&t.estimate>0);
+ const budgetCents=comparable.reduce((n,t)=>n+cents(t.estimate),0),actualCents=comparable.reduce((n,t)=>n+cents(t.costs.freight),0);
+ const extrasCents=declared.reduce((n,t)=>n+cents(t.costs.holding)+cents(t.costs.unloading)+cents(t.costs.extras),0);
+ return {trips:scope.length,declared:declared.length,pending:scope.length-declared.length,comparable:comparable.length,zeroOrMissingBaseline:declared.length-comparable.length,budget:budgetCents/100,actual:actualCents/100,variance:(actualCents-budgetCents)/100,variancePct:budgetCents>0?(actualCents-budgetCents)/budgetCents*100:null,extras:extrasCents/100,totalActual:(declared.reduce((n,t)=>n+cents(t.costs.freight),0)+extrasCents)/100,overruns:comparable.filter(t=>cents(t.costs.freight)>cents(t.estimate)).length,coverage:scope.length?declared.length/scope.length*100:null,rows:scope};
+}
+const permissions={saveTruck:['manager'],saveMaterial:['manager'],reviewMaster:['planner','manager'],prepareNote:['accounts','manager'],approveNote:['manager']};
+export const enhancementTypes=Object.keys(permissions);
+export function enhancementCommand(input,type,p,role){
+ ensure(permissions[type]?.includes(role),'This action requires a different demonstration role.');const state=hydrateState(input),who={manager:'MGR-01',accounts:'ACC-01',planner:'OP-01'}[role];let result=p.returnId||p.id||p.shipment;
+ if(type==='saveTruck'){
+  ensure(p.name?.trim(),'Truck name is required.');ensure([p.capacity,p.volume,p.rate].every(finitePositive),'Payload, usable volume and base freight must be positive finite numbers.');
+  ensure(Number.isSafeInteger(cents(p.rate))&&cents(p.rate)>0,'Base freight must be at least INR 0.01 within the supported amount.');const id=p.id||`T${Math.max(0,...state.trucks.map(t=>Number(t.id.slice(1))||0))+1}`,existing=state.trucks.find(t=>t.id===id);ensure(!p.id||existing,'Truck record not found.');
+  const record={id,name:p.name.trim(),capacity:p.capacity,volume:p.volume,rate:Math.round(p.rate*100)/100,active:p.active!==false,revision:(existing?.revision||0)+1};
+  if(existing)Object.assign(existing,record);else state.trucks.push(record);
+  state.masterRevision++;for(const trip of state.shipments)if(!trip.dispatched&&trip.truck===id)trip.masterReviewRequired=true;result=id;
+ }else if(type==='saveMaterial'){
+  const m=state.skus.find(m=>m.id===p.id);ensure(m,'Material not found.');ensure(p.name?.trim(),'Material name is required.');ensure([p.length,p.width,p.height,p.unitWeight,p.unitValue].every(finitePositive),'Packed dimensions, weight and value must be positive finite numbers.');
+  ensure(Number.isSafeInteger(cents(p.unitValue))&&cents(p.unitValue)>0,'Goods value must be at least INR 0.01 within the supported amount.');const volume=p.length*p.width*p.height/1e6;ensure(finitePositive(volume),'Dimensions produce an invalid volume.');Object.assign(m,{name:p.name.trim(),dimensions:{length:p.length,width:p.width,height:p.height},unitWeight:p.unitWeight,unitVolume:volume,unitValue:Math.round(p.unitValue*100)/100,revision:m.revision+1});state.masterRevision++;
+  for(const trip of state.shipments)if(!trip.dispatched&&trip.lines.some(l=>l.sku===m.id))trip.masterReviewRequired=true;
+ }else if(type==='reviewMaster'){
+  const trip=state.shipments.find(t=>t.id===p.shipment);ensure(trip&&!trip.dispatched,'Only preparing shipments can refresh master assumptions.');const truck=state.trucks.find(t=>t.id===trip.truck),values=load(state,trip);ensure(truck?.active,'Chosen truck is inactive. Replanning is required.');ensure(values.weight<=truck.capacity&&values.volume<=truck.volume,'Revised load exceeds the selected truck. Replanning is required.');trip.loadSnapshot=values;trip.truckSnapshot={id:truck.id,name:truck.name,capacity:truck.capacity,volume:truck.volume,revision:truck.revision};trip.masterReviewRequired=false;
+ }else {
+  const r=state.returns.find(r=>r.id===p.returnId);ensure(r&&r.status==='Reconciled · note pending','Inspect the return before preparing or approving a note.');
+  if(type==='prepareNote'){
+   ensure(['Credit note','Debit note'].includes(p.noteType),'Choose credit note or debit note.');ensure(p.reference?.trim()&&p.issuer?.trim()&&p.recipient?.trim()&&p.invoiceReference?.trim()&&p.reason?.trim(),'Complete reference, issuer, recipient, source invoice and reason.');
+   ensure(Number.isInteger(p.quantity)&&p.quantity>0&&p.quantity<=r.expected,'Note quantity must be a positive whole quantity within the return case.');ensure([p.unitRate,p.taxAmount].every(n=>Number.isFinite(n)&&n>=0),'Rate and manually supplied tax must be non-negative numbers.');
+   const duplicate=state.returns.find(x=>{const n=x.noteDraft||x.note;return x.id!==r.id&&n?.reference&&n?.issuer&&n.reference.toLowerCase()===p.reference.trim().toLowerCase()&&n.issuer.toLowerCase()===p.issuer.trim().toLowerCase();});ensure(!duplicate,'That issuer already has a note with this reference.');
+   const subtotalCents=cents(p.unitRate)*p.quantity,taxCents=cents(p.taxAmount);ensure(Number.isSafeInteger(subtotalCents)&&Number.isSafeInteger(taxCents)&&Number.isSafeInteger(subtotalCents+taxCents),'Note value exceeds the supported amount.');
+   const revision=(r.noteDraft?.revision||0)+1;r.noteDraft={id:r.noteDraft?.id||`DRAFT-${state.noteCounter++}`,revision,type:p.noteType,reference:p.reference.trim(),date:new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date()),issuer:p.issuer.trim(),recipient:p.recipient.trim(),invoiceReference:p.invoiceReference.trim(),shipment:r.shipment,returnId:r.id,sku:r.sku,quantity:p.quantity,unitRate:cents(p.unitRate)/100,subtotal:subtotalCents/100,taxAmount:taxCents/100,total:(subtotalCents+taxCents)/100,currency:'INR',reason:p.reason.trim(),preparedBy:'3PL · '+who,status:'Draft',approvedBy:null,approvedAt:null};
+  }else{ensure(r.noteDraft,'Prepare a note first.');ensure(p.reason?.trim(),'Manager approval rationale is required.');ensure(r.noteDraft.status==='Draft','This note has already been approved.');Object.assign(r.noteDraft,{status:'Approved draft',approvedBy:who,approvedAt:new Date().toISOString(),approvalReason:p.reason});}
+  result=r.id;
+ }
+ state.events.unshift({id:`EV-${Date.now()}-${state.events.length}`,time:new Date().toISOString(),actor:who,role,shipment:p.shipment||state.returns.find(r=>r.id===p.returnId)?.shipment||'',action:type,detail:p.reason||p.name||p.reference||'Master data reviewed'});return {state,result};
+}
+const escape=x=>String(x??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+export function noteHTML(note){
+ ensure(note,'No draft note prepared.');const e=escape,fmt=n=>Number(n).toFixed(2);
+ return `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${e(note.reference)} — draft ${e(note.type)}</title><style>body{font:14px system-ui;color:#19382f;max-width:850px;margin:40px auto;padding:25px}header{display:flex;justify-content:space-between;border-bottom:3px solid #215b45;padding-bottom:20px}h1{margin:0 0 10px}.banner{background:#fff3d6;padding:14px;margin:20px 0;font-weight:600}.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}p{line-height:1.7}table{border-collapse:collapse;width:100%;margin-top:25px}td,th{border:1px solid #dce4d6;padding:12px;text-align:left}.totals{margin-left:auto;width:300px}.foot{border-top:1px solid #dce4d6;margin-top:35px;padding-top:15px;color:#748170;font-size:12px}@media print{body{margin:0;padding:15px}.banner{border:1px solid #a07836}}</style><header><div><h1>${e(note.type)}</h1>Last Mile Logistics · 3PL preparation</div><div>${e(note.reference)}<br>${e(note.date)}<br>${e(note.status)} · v${note.revision}</div></header><div class="banner">DRAFT / DEMONSTRATION — not a tax invoice or legally issued financial note. Internal approval does not constitute statutory issuance.</div><div class="grid"><p><b>Issuer / authorized entity</b><br>${e(note.issuer)}</p><p><b>Recipient / counterparty</b><br>${e(note.recipient)}</p><p><b>Source invoice</b><br>${e(note.invoiceReference)}</p><p><b>Traceability</b><br>Return ${e(note.returnId)} · Shipment ${e(note.shipment)}</p></div><table><thead><tr><th>Material</th><th>Quantity</th><th>Unit rate (INR)</th><th>Subtotal (INR)</th></tr></thead><tbody><tr><td>${e(note.sku)}</td><td>${note.quantity}</td><td>${fmt(note.unitRate)}</td><td>${fmt(note.subtotal)}</td></tr></tbody></table><table class="totals"><tr><td>Subtotal</td><td>INR ${fmt(note.subtotal)}</td></tr><tr><td>Manually entered tax</td><td>INR ${fmt(note.taxAmount)}</td></tr><tr><th>Draft total</th><th>INR ${fmt(note.total)}</th></tr></table><p><b>Reason / perspective</b><br>${e(note.reason)}</p><p><b>Prepared by</b> ${e(note.preparedBy)}<br><b>Internal approval</b> ${e(note.approvedBy||'Pending')}${note.approvedAt?' · '+e(note.approvedAt):''}</p><div class="foot">No external accounting entry or payment is created. Tax was entered manually; this document does not verify tax applicability. Open this HTML in a browser and use Print / Save as PDF.</div></html>`;
+}
